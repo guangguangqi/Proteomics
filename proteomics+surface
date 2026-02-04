@@ -1,0 +1,99 @@
+# --- Environment Setup ---
+# Core
+library(tidyverse)
+library(limma)
+# Proteomics-specific
+library(MSstats)
+# Annotation & enrichment
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+# Surfaceome & Topology (Critical)
+library(biomaRt)
+library(UniProt.ws)
+
+# 1 Input: MaxQuant proteinGroups.txt
+#######################################
+
+pg <- read.delim("proteinGroups.txt", stringsAsFactors = FALSE)
+
+# Clean data: Remove contaminants and decoys
+pg <- pg %>%
+  filter(Reverse != "+", Potential.contaminant != "+", Only.identified.by.site != "+")
+
+# Select intensity columns (e.g., LFQ intensity)
+intensity_cols <- grep("^LFQ.intensity", colnames(pg), value = TRUE)
+expr <- pg %>%
+  select(Protein.IDs, all_of(intensity_cols)) %>%
+  column_to_rownames("Protein.IDs")
+
+# 2 Preprocessing
+#################################################
+expr_log <- log2(expr + 1)
+# Filter: Keep proteins with < 50% missing values per row
+keep <- rowMeans(is.na(expr_log) | expr_log == 0) < 0.5
+expr_log <- expr_log[keep, ]
+
+###############################
+# 3 Normalization
+expr_norm <- normalizeBetweenArrays(as.matrix(expr_log), method = "quantile")
+
+##################################
+# 4 Experimental Design (Adjust for your specific samples)
+# Example: 3 Ctrl, 3 Trt
+group <- factor(c(rep("Ctrl", 3), rep("Trt", 3)))
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+contrast <- makeContrasts(Trt_vs_Ctrl = Trt - Ctrl, levels = design)
+
+#######################################
+# 5 Differential Analysis (limma)
+fit <- lmFit(expr_norm, design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+res <- topTable(fit2, coef = "Trt_vs_Ctrl", number = Inf, adjust.method = "BH")
+
+############################################
+# 6 DE Significance Table
+res <- res %>%
+  rownames_to_column("ProteinID") %>%
+  # Handle cases where ProteinID contains multiple IDs (take first one)
+  mutate(ProteinID = sub(";.*", "", ProteinID)) %>%
+  mutate(sig = adj.P.Val < 0.05 & abs(logFC) > 1)
+
+##############################################
+# 7 ID Mapping (UniProt → Entrez)
+entrez <- bitr(res$ProteinID, fromType = "UNIPROT", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+res <- left_join(res, entrez, by = c("ProteinID" = "UNIPROT"))
+
+################################################
+# 8 Surfaceome Filtering (Plasma Membrane)
+# Uses biomaRt to fetch GO:0005886 (Plasma Membrane)
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+surface_ids <- getBM(attributes = 'uniprotswissprot',
+                     filters = 'go_id',
+                     values = 'GO:0005886', 
+                     mart = mart)$uniprotswissprot
+
+res <- res %>% mutate(is_surface = ProteinID %in% surface_ids)
+
+##############################################
+# 9 CAR Accessibility (UniProt Topology)
+# Only query UniProt for significant surface proteins to save time
+up <- UniProt.ws(taxId = 9606)
+sig_surface <- res %>% filter(sig & is_surface) %>% pull(ProteinID)
+
+topology_info <- select(up, keys = sig_surface, columns = c("TOPOLOGY"))
+accessible_ids <- topology_info %>%
+  filter(grepl("Extracellular", TOPOLOGY, ignore.case = TRUE)) %>%
+  pull(UNIPROTKB)
+
+res <- res %>% mutate(car_accessible = ProteinID %in% accessible_ids)
+
+################################################
+# 10 Result: CAR-T Candidate Prioritization
+final_candidates <- res %>%
+  filter(sig & is_surface & car_accessible) %>%
+  arrange(desc(logFC))
+
+print(head(final_candidates))
