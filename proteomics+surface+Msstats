@@ -1,0 +1,84 @@
+# --- Environment Setup ---
+library(MSstats)
+library(tidyverse)
+library(biomaRt)
+library(UniProt.ws)
+library(org.Hs.eg.db)
+
+############################################
+# 1 Input & Formatting (MaxQuant → MSstats)
+# Requires 'annotation.csv' with columns: Raw.file, Condition, BioReplicate, Run
+mq_raw <- MaxQtoMSstatsFormat(
+  evidence = "evidence.txt",
+  annotation = "annotation.csv",
+  proteinGroups = "proteinGroups.txt",
+  removeProtein_with1Peptide = TRUE # Higher confidence for CAR targets
+)
+
+###################################################
+# 2 Data Processing (Normalization & Summarization)
+processed <- dataProcess(
+  mq_raw,
+  normalization = "equalizeMedians",
+  summaryMethod = "TMP", # Tukey's Median Polish
+  featureSubset = "highQuality",
+  censoredInt = "NA"
+)
+
+#######################################################
+# 3 Statistical Differential Analysis
+# Ensure the contrast matrix matches the levels in your annotation.csv
+comparison <- matrix(c(-1, 1), nrow = 1)
+row.names(comparison) <- "Trt_vs_Ctrl"
+colnames(comparison) <- c("Ctrl", "Trt")
+
+msstats_res <- groupComparison(contrast.matrix = comparison, data = processed)
+res_table <- msstats_res$ComparisonResult
+
+##################################################
+# 4 Format Results for Annotation
+res_clean <- res_table %>%
+  filter(!is.na(adj.pvalue)) %>%
+  rename(ProteinID = Protein, logFC = log2FC) %>%
+  mutate(ProteinID = sub(";.*", "", ProteinID), # Clean UniProt IDs
+         sig = adj.pvalue < 0.05 & abs(logFC) > 1)
+##############################################################
+# 5 Surfaceome Filtering (Plasma Membrane)
+# Direct query to BioMart for GO:0005886 (Plasma Membrane)
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+surface_list <- getBM(
+  attributes = 'uniprotswissprot',
+  filters = 'go_id',
+  values = 'GO:0005886', 
+  mart = mart
+)$uniprotswissprot
+
+res_clean <- res_clean %>% 
+  mutate(is_surface = ProteinID %in% surface_list)
+
+###############################################################
+# 6 CAR Accessibility (UniProt Topology Check)
+# Check for Extracellular Domains (ECD) in significant surface proteins
+up <- UniProt.ws(taxId = 9606)
+sig_surface_ids <- res_clean %>% filter(sig & is_surface) %>% pull(ProteinID)
+
+# Pull Topology data
+topology_info <- select(up, keys = sig_surface_ids, columns = c("TOPOLOGY"))
+accessible_ids <- topology_info %>%
+  filter(grepl("Extracellular", TOPOLOGY, ignore.case = TRUE)) %>%
+  pull(UNIPROTKB)
+
+res_clean <- res_clean %>% 
+  mutate(car_accessible = ProteinID %in% accessible_ids)
+
+###################################################################
+# 7 Final Candidate Selection
+# Prioritize targets: Sig Up-regulated + On Surface + Accessible ECD
+car_candidates <- res_clean %>%
+  filter(sig & is_surface & car_accessible & logFC > 0) %>%
+  arrange(adj.pvalue)
+
+print(head(car_candidates))
+
+# 📊 Quick Visualization: MSstats Volcano Plot
+groupComparisonPlots(data = msstats_res$ComparisonResult, type = "VolcanoPlot")
